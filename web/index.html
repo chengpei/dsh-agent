@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DeepSeek Harness 对话</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8; --panel: #ffffff; --border: #e4e4e7;
+    --text: #1a1a2e; --muted: #6b7280;
+    --user: #0a84ff; --user-fg: #ffffff; --ai: #ececf1;
+    --tool: #f3f4f6; --tool-border: #d4d4d8;
+    --err: #dc2626; --accent: #0a84ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c; --panel: #202226; --border: #34363c;
+      --text: #ececf1; --muted: #9ca3af;
+      --ai: #32343a; --tool: #2a2c31; --tool-border: #3f4148;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+    background: var(--bg); color: var(--text);
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; flex: 1; }
+  #sessionId { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+  #newChat { border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  #newChat:hover { border-color: var(--accent); }
+  main { flex: 1; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 16px; max-width: 860px; width: 100%; margin: 0 auto; }
+  .row { display: flex; gap: 12px; align-items: flex-start; }
+  .row.user { justify-content: flex-end; }
+  .bubble { max-width: 76%; padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.55; font-size: 14px; }
+  .row.user .bubble { background: var(--user); color: var(--user-fg); border-bottom-right-radius: 4px; }
+  .row.ai .bubble { background: var(--ai); border-bottom-left-radius: 4px; }
+  .caret { display: inline-block; width: 7px; height: 15px; margin-left: 2px; background: var(--accent);
+    vertical-align: text-bottom; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .toolrow { display: flex; flex-direction: column; gap: 4px; max-width: 76%; }
+  .tool { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px;
+    background: var(--tool); border: 1px solid var(--tool-border); padding: 6px 10px;
+    border-radius: 8px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+  .error .bubble { background: var(--err); color: #fff; }
+  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 20px; }
+  form { max-width: 860px; width: 100%; margin: 0 auto; display: flex; gap: 10px; }
+  #input { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; padding: 11px 14px; font-size: 14px; resize: none; }
+  #input:focus { outline: none; border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #send { border: none; background: var(--accent); color: #fff; padding: 0 20px;
+    border-radius: 10px; font-size: 14px; cursor: pointer; }
+  .hint { text-align:center; color: var(--muted); font-size: 12px; padding-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DeepSeek Harness 对话</h1>
+  <span id="sessionId"></span>
+  <button id="newChat" type="button">新开对话</button>
+</header>
+<main id="messages"></main>
+<footer>
+  <form id="form">
+    <textarea id="input" rows="1" placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"></textarea>
+    <button id="send" type="submit">发送</button>
+  </form>
+  <div class="hint">每次问题接着上一次的上下文；点「新开对话」另起一段</div>
+</footer>
+
+<script>
+let busy = false;           // 是否正在生成（期间禁用输入/发送）
+let pendingReset = false;   // 下一次提问是否新开会话
+const messagesEl = document.getElementById('messages');
+const inputEl = document.getElementById('input');
+const formEl = document.getElementById('form');
+const sendBtn = document.getElementById('send');
+const newChatBtn = document.getElementById('newChat');
+const sessionIdEl = document.getElementById('sessionId');
+
+// ---- 消息气泡管理 ----
+// 记录 ai 气泡：key 用 assistant message 的 id，同一 id 复用同一气泡并替换为最新快照
+const aiBubbles = new Map();  // messageId -> {rowEl, textEl, fullText, timer, printed}
+
+function addUser(msg) {
+  const row = div('row user');
+  row.appendChild(div('bubble', escapeHtml(msg)));
+  messagesEl.appendChild(row);
+  scrollBottom();
+}
+
+function ensureAiBubble(id) {
+  let rec = aiBubbles.get(id);
+  if (!rec) {
+    const row = div('row ai');
+    const bubble = div('bubble');
+    row.appendChild(bubble);
+    // 区别于工具等，行内放 text
+    row.dataset.role = 'ai';
+    messagesEl.appendChild(row);
+    rec = { row, textEl: bubble, fullText: '', timer: null, caret: null };
+    aiBubbles.set(id, rec);
+  }
+  return rec;
+}
+
+function clearAnimation(rec) {
+  if (rec.timer) { clearInterval(rec.timer); rec.timer = null; }
+  if (rec.timers) { rec.timers.forEach(clearTimeout); rec.timers = []; }
+  if (rec.caret) { rec.caret.remove(); rec.caret = null; }
+}
+
+function addTool(label, detail) {
+  const row = div('row ai');
+  const wrap = div('toolrow');
+  wrap.appendChild(div('tool', escapeHtml(label)));
+  if (detail) wrap.appendChild(div('tool', escapeHtml(detail)));
+  row.appendChild(wrap);
+  messagesEl.appendChild(row);
+  scrollBottom();
+}
+
+// ---- 事件处理 ----
+function handleSSEFrame(type, data) {
+  switch (type) {
+    case 'meta':
+      sessionIdEl.textContent = 'session: ' + data.session_id;
+      break;
+    case 'msg_start': {
+      // 服务端开始推送一条 assistant 消息。建气泡并开始累积，text 兜底用 fullText
+      const rec = ensureAiBubble(data.id);
+      clearAnimation(rec);
+      rec._buf = '';
+      rec.fullText = data.text || '';
+      rec.textEl.textContent = '';
+      scrollBottom();
+      break;
+    }
+    case 'text': {
+      // 服务端逐 token 推来的增量：收到即渲染，不做本地重放
+      const rec = ensureAiBubble(data.id);
+      rec._buf = (rec._buf || '') + (data.token || '');
+      rec.textEl.textContent = rec._buf;
+      scrollBottom();
+      break;
+    }
+    case 'msg_end': {
+      // 一条消息推完；整条为空时用完整文本兜底，避免空白气泡
+      const rec = ensureAiBubble(data.id);
+      if (!rec._buf) rec.textEl.textContent = data.text || '';
+      break;
+    }
+    case 'agent': {
+      const t = data.type;
+      if (t === 'assistant/message') {
+        // 兜底（正常走 msg_start/text/msg_end 流式帧）：极端情况整段显示
+        const msg = (data.data || {}).message || {};
+        const fullText = (msg.content || [])
+          .filter(b => b && b.type === 'text')
+          .map(b => b.text || '').join('');
+        if (!fullText) break;
+        const rec = ensureAiBubble(msg.id || 'assistant');
+        clearAnimation(rec);
+        rec.textEl.textContent = fullText;
+      } else if (t === 'tool/call') {
+        const d = data.data || {};
+        addTool('tool: ' + (d.name || 'unknown'), d.arguments || '');
+      } else if (t === 'tool/result') {
+        const msg = (data.data || {}).message || {};
+        const text = (msg.content || [])
+          .filter(b => b && b.type === 'text')
+          .map(b => b.text || '').join('');
+        addTool(msg.isError ? '结果（出错）：' : '结果：', text || '(无返回)');
+      }
+      break;
+    }
+    case 'status':
+      stopLoading();
+      if (data.finish_reason === 'error') {
+        errorBubble(data.final_response ? '（模型以 error 结束）' + data.final_response : '模型以 error 结束');
+      }
+      break;
+    case 'error':
+      stopLoading();
+      errorBubble('出错：' + (data.message || '未知错误'));
+      break;
+  }
+}
+
+function errorBubble(text) {
+  const row = div('row ai error');
+  row.appendChild(div('bubble', escapeHtml(text)));
+  messagesEl.appendChild(row);
+  scrollBottom();
+}
+
+// ---- 发送 ----
+async function ask() {
+  const text = inputEl.value.trim();
+  if (!text || busy) return;
+  addUser(text);
+  inputEl.value = '';
+  setBusy(true);
+
+  const body = { message: text, reset: pendingReset };
+  pendingReset = false;
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+    // 逐帧解析 SSE
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // 按空行分帧
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const { type, data } = parseSSE(frame);
+        if (type) handleSSEFrame(type, data);
+      }
+    }
+  } catch (err) {
+    stopLoading();
+    errorBubble('请求失败：' + err.message);
+  }
+}
+
+function parseSSE(frame) {
+  let type = null; const lines = [];
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) type = line.slice(6).trim();
+    else if (line.startsWith('data:')) lines.push(line.slice(5).trim());
+  }
+  if (!lines.length) return { type, data: null };
+  try { return { type, data: JSON.parse(lines.join('\n')) }; }
+  catch { return { type, data: null }; }
+}
+
+function setBusy(b) {
+  busy = b;
+  inputEl.disabled = b; sendBtn.disabled = b;
+  if (!b) { inputEl.focus(); resizeInput(); }
+}
+
+function stopLoading() {
+  // 结束 loading。流式文本早已实时渲染完毕；这里只做无害清理，
+  // 并在气泡异常为空时用 msg_start 的兜底全文本补全，避免空白。
+  for (const rec of aiBubbles.values()) {
+    clearAnimation(rec);
+    if (!rec.textEl.textContent && rec.fullText) {
+      rec.textEl.textContent = rec.fullText;
+    }
+  }
+  setBusy(false);
+}
+
+// ---- 工具函数 ----
+function div(cls, html) {
+  const e = document.createElement('div');
+  e.className = cls;
+  e.innerHTML = (html == null) ? '' : html;
+  return e;
+}
+function scrollBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function resizeInput() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+}
+inputEl.addEventListener('input', resizeInput);
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); }
+});
+formEl.addEventListener('submit', e => { e.preventDefault(); ask(); });
+newChatBtn.addEventListener('click', () => {
+  pendingReset = true;
+  messagesEl.replaceChildren('');
+  aiBubbles.clear();
+  sessionIdEl.textContent = '';
+  setBusy(false);
+  inputEl.focus();
+});
+resizeInput();
+</script>
+</body>
+</html>
